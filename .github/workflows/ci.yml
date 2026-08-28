@@ -29,5 +29,8 @@ jobs:
       - name: Build release binary
         run: make
 
+      - name: Install ShellCheck
+        run: brew install shellcheck
+
       - name: Lint shell wrapper
         run: shellcheck wallpaper-pick
