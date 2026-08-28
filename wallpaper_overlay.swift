@@ -144,19 +144,57 @@ final class ImageBox {
     init(_ image: CGImage) { self.image = image }
 }
 
+/// Decoded thumbnails, cached in memory for this run and on disk across runs.
+///
+/// These are full-resolution wallpapers -- decoding the twelve in one theme folder
+/// serially costs about 1.7s, and a single 10240x5760 PNG accounts for 744ms of that.
+/// Three things keep the picker responsive anyway: decodes run concurrently, the
+/// selected image is asked for first, and the downsampled result is kept on disk so a
+/// second launch draws immediately instead of decoding again.
 final class ThumbnailStore {
-    private let queue = DispatchQueue(label: "wallpaper-overlay.thumbnails", qos: .userInitiated)
+    /// Concurrent, but bounded: the unsorted folder holds 66 wallpapers and an
+    /// unbounded fan-out there would have every core decoding a different 70MB PNG.
+    private let queue = DispatchQueue(label: "wallpaper-overlay.thumbnails",
+                                      qos: .userInitiated, attributes: .concurrent)
+    private let slots: DispatchSemaphore
     private let cache = NSCache<NSString, ImageBox>()
     private var loading = Set<String>()
     private let pixelWidth: Int
+    private let cacheDirectory: URL?
+
+    /// How long a disk entry is kept. This is a retention choice, not a correctness
+    /// one -- the cache key already covers staleness, so raising it only costs disk.
+    private static let ttl: TimeInterval = 40 * 60
 
     init(pixelWidth: Int) {
         self.pixelWidth = pixelWidth
+        self.slots = DispatchSemaphore(value: ProcessInfo.processInfo.activeProcessorCount)
         cache.countLimit = 18
+
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        let directory = base?.appendingPathComponent("wallpaper-overlay/thumbs", isDirectory: true)
+        if let directory,
+           (try? FileManager.default.createDirectory(at: directory,
+                                                     withIntermediateDirectories: true)) != nil {
+            self.cacheDirectory = directory
+        } else {
+            // A cache we cannot write is not a reason to fail; decode every time.
+            self.cacheDirectory = nil
+        }
     }
 
     func image(for path: String) -> CGImage? {
         cache.object(forKey: path as NSString)?.image
+    }
+
+    /// Synchronous disk lookup, cheap enough to run before the window is shown: the
+    /// cached file is already thumbnail-sized, so this is a couple of milliseconds
+    /// rather than the full-resolution decode it replaces.
+    func cachedImage(for path: String) -> CGImage? {
+        if let image = image(for: path) { return image }
+        guard let image = readCache(for: path) else { return nil }
+        cache.setObject(ImageBox(image), forKey: path as NSString)
+        return image
     }
 
     func load(path: String, completion: @escaping (String, CGImage?) -> Void) {
@@ -169,13 +207,110 @@ final class ThumbnailStore {
 
         queue.async { [weak self] in
             guard let self else { return }
-            let image = self.decode(path: path)
+            self.slots.wait()
+            let cached = self.readCache(for: path)
+            let image = cached ?? self.decode(path: path)
+            self.slots.signal()
             DispatchQueue.main.async {
                 if let image { self.cache.setObject(ImageBox(image), forKey: path as NSString) }
                 self.loading.remove(path)
                 completion(path, image)
             }
+            // Written after the image is handed over, so a cold launch never pays for
+            // the cache it is filling.
+            if cached == nil, let image { self.writeCache(image, for: path) }
         }
+    }
+
+    /// Decodes everything the ±3 window will not reach into the disk cache, so arrowing
+    /// past the fourth image stays instant. Runs below the interactive decodes and
+    /// deliberately does not touch the memory cache -- 66 decoded images is exactly what
+    /// countLimit exists to prevent.
+    func warm(paths: [String]) {
+        guard cacheDirectory != nil else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            for path in paths {
+                if self.cacheURL(for: path).flatMap({ self.unexpired($0) }) != nil { continue }
+                self.slots.wait()
+                let image = self.decode(path: path)
+                self.slots.signal()
+                if let image { self.writeCache(image, for: path) }
+            }
+        }
+    }
+
+    /// Drops entries past the hold time. Failures are ignored throughout: a cache sweep
+    /// must never be able to affect the picker.
+    func sweep() {
+        guard let directory = cacheDirectory else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let keys: [URLResourceKey] = [.contentModificationDateKey]
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: keys) else { return }
+            let cutoff = Date().addingTimeInterval(-ThumbnailStore.ttl)
+            for entry in entries {
+                let modified = (try? entry.resourceValues(forKeys: Set(keys)))?
+                    .contentModificationDate
+                if let modified, modified >= cutoff { continue }
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+    }
+
+    // MARK: cache plumbing
+
+    /// Keyed by the source's identity and the size we rendered it at, so a re-saved
+    /// wallpaper or a display with a different backing scale misses cleanly rather than
+    /// serving something stale or the wrong size.
+    private func cacheURL(for path: String) -> URL? {
+        guard let directory = cacheDirectory else { return nil }
+        let values = try? URL(fileURLWithPath: path)
+            .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let size = values?.fileSize ?? 0
+        let seed = "\(path)\0\(Int(modified))\0\(size)\0\(pixelWidth)"
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in Array(seed.utf8) {
+            hash = (hash ^ UInt64(byte)) &* 0x100000001b3
+        }
+        return directory.appendingPathComponent(String(format: "%016llx.jpg", hash))
+    }
+
+    private func unexpired(_ url: URL) -> URL? {
+        let key: URLResourceKey = .contentModificationDateKey
+        guard let modified = (try? url.resourceValues(forKeys: [key]))?.contentModificationDate,
+              modified >= Date().addingTimeInterval(-ThumbnailStore.ttl) else { return nil }
+        return url
+    }
+
+    private func readCache(for path: String) -> CGImage? {
+        guard let url = cacheURL(for: path) else { return nil }
+        guard unexpired(url) != nil else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    private func writeCache(_ image: CGImage, for path: String) {
+        guard let url = cacheURL(for: path) else { return }
+        // Written to a sibling and renamed: the process exits with exit(), so a warm
+        // pass can be killed mid-write, and a truncated JPEG would read back as a
+        // perfectly valid -- and wrong -- thumbnail on the next launch.
+        let temporary = url.deletingLastPathComponent()
+            .appendingPathComponent(UUID().uuidString + ".tmp")
+        guard let destination = CGImageDestinationCreateWithURL(
+            temporary as CFURL, "public.jpeg" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(destination, image,
+                                   [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            try? FileManager.default.removeItem(at: temporary)
+            return
+        }
+        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.moveItem(at: temporary, to: url)
     }
 
     private func decode(path: String) -> CGImage? {
@@ -200,6 +335,9 @@ final class Card {
     private let accent: NSColor
     private let scaleFactor: CGFloat
     private(set) var path: String
+    /// Set while the card is sliding off. It stays in the view's table until the slide
+    /// finishes so that arrowing back can reclaim it mid-flight.
+    var departing = false
 
     init(path: String, accent: NSColor, muted: NSColor, scaleFactor: CGFloat) {
         self.path = path
@@ -238,7 +376,7 @@ final class Card {
 
         CATransaction.begin()
         CATransaction.setDisableActions(!animated)
-        CATransaction.setAnimationDuration(0.28)
+        CATransaction.setAnimationDuration(OverlayView.transition)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
         root.frame = frame
         root.opacity = opacity
@@ -277,6 +415,10 @@ final class Card {
 // MARK: - view
 
 final class OverlayView: NSView {
+    /// One discrete step. Short enough that a held arrow key keeps up, and paired with
+    /// cards that actually travel in and out it reads as a slide rather than a fade.
+    static let transition: CFTimeInterval = 0.14
+
     private let dim = CALayer()
     private let titleLabel = CATextLayer()
     private let filenameLabel = CATextLayer()
@@ -392,7 +534,8 @@ final class OverlayView: NSView {
                 let index = selected + slot
                 guard wallpapers.indices.contains(index) else { continue }
                 let path = wallpapers[index].path
-                guard let card = cards[path], card.contains(point) else { continue }
+                guard let card = cards[path], !card.departing,
+                      card.contains(point) else { continue }
                 return index
             }
         }
@@ -408,32 +551,56 @@ final class OverlayView: NSView {
         let wanted = Set(visible.map { wallpapers[$0.1].path })
 
         for (path, card) in cards where !wanted.contains(path) {
+            guard !card.departing else { continue }
+            guard animated else {
+                card.root.removeFromSuperlayer()
+                cards.removeValue(forKey: path)
+                continue
+            }
+            // Slide it out rather than deleting it on the spot, and keep it in the table
+            // until it lands so a reversal can catch it. The completion block re-checks
+            // the flag: by the time it runs the card may have been reclaimed.
+            card.departing = true
+            let exit = card.root.frame.midX < bounds.midX ? -3 : 3
             CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            card.root.removeFromSuperlayer()
+            CATransaction.setCompletionBlock { [weak self, weak card] in
+                guard let self, let card, card.departing else { return }
+                card.root.removeFromSuperlayer()
+                self.cards.removeValue(forKey: path)
+            }
+            card.setGeometry(frame: frame(for: exit), opacity: opacity(for: exit),
+                             focused: false, z: z(for: exit), animated: true)
             CATransaction.commit()
         }
-        cards = cards.filter { wanted.contains($0.key) }
 
         for (slot, index) in visible.sorted(by: { $0.0 < $1.0 }) {
             let wallpaper = wallpapers[index]
             let path = wallpaper.path
             let card: Card
-            let alreadyVisible: Bool
+            let travelling: Bool
             if let existing = cards[path] {
                 card = existing
-                alreadyVisible = true
+                // Reclaimed mid-exit: clearing the flag defuses its completion block.
+                card.departing = false
+                travelling = true
             } else {
                 card = Card(path: path, accent: palette.accent, muted: palette.muted,
                             scaleFactor: scaleFactor)
-                card.set(path: path, cgImage: thumbnails.image(for: path))
+                card.set(path: path, cgImage: thumbnails.cachedImage(for: path))
                 cards[path] = card
                 layer?.addSublayer(card.root)
-                alreadyVisible = false
+                if animated {
+                    // Park it off-screen on the side it is arriving from, instantly, so
+                    // that the animated pass below has somewhere to travel from.
+                    let entry = slot < 0 ? -3 : 3
+                    card.setGeometry(frame: frame(for: entry), opacity: opacity(for: entry),
+                                     focused: false, z: z(for: entry), animated: false)
+                }
+                travelling = animated
             }
             card.setGeometry(frame: frame(for: slot), opacity: opacity(for: slot),
                              focused: slot == 0, z: z(for: slot),
-                             animated: animated && alreadyVisible)
+                             animated: animated && travelling)
         }
     }
 
@@ -445,6 +612,7 @@ final class OverlayView: NSView {
         switch abs(slot) {
         case 1: distance = centerSize.width * 0.58
         case 2: distance = centerSize.width * 0.92
+        case 3: distance = centerSize.width * 1.25
         default: distance = 0
         }
         let center = CGPoint(x: bounds.midX + CGFloat(sign) * distance, y: bounds.midY)
@@ -452,10 +620,13 @@ final class OverlayView: NSView {
                       width: size.width, height: size.height)
     }
 
+    // |slot| == 3 is never a resting position -- it is only where cards slide in from
+    // and out to, far enough past the edge that the travel reads as motion, not a pop.
     private func scale(for slot: Int) -> CGFloat {
         switch abs(slot) {
         case 1: return 0.72
         case 2: return 0.52
+        case 3: return 0.40
         default: return 1
         }
     }
@@ -464,6 +635,7 @@ final class OverlayView: NSView {
         switch abs(slot) {
         case 1: return 0.55
         case 2: return 0.25
+        case 3: return 0
         default: return 1
         }
     }
@@ -509,9 +681,26 @@ final class OverlayView: NSView {
         }
     }
 
+    /// Ordered by distance from the selection rather than by index, so the image the
+    /// user is looking at claims a decode slot first. Ascending order put it fourth in
+    /// line, behind up to three unrelated full-resolution decodes.
+    /// Called once the overlay is on screen: everything the ±3 window will not reach is
+    /// decoded into the disk cache in the background, and stale entries are dropped.
+    func warmRemaining() {
+        let near = Set((max(0, selected - 3) ... min(wallpapers.count - 1, selected + 3))
+            .map { wallpapers[$0].path })
+        thumbnails.warm(paths: wallpapers.map(\.path).filter { !near.contains($0) })
+        thumbnails.sweep()
+    }
+
     private func prefetch() {
-        let range = max(0, selected - 3) ... min(wallpapers.count - 1, selected + 3)
-        for index in range {
+        var indices = [selected]
+        for step in 1 ... 3 {
+            for index in [selected - step, selected + step] where wallpapers.indices.contains(index) {
+                indices.append(index)
+            }
+        }
+        for index in indices {
             let path = wallpapers[index].path
             thumbnails.load(path: path) { [weak self] loadedPath, image in
                 guard let self, let card = self.cards[loadedPath], card.path == loadedPath else {
@@ -605,6 +794,8 @@ final class Controller: NSObject, NSApplicationDelegate {
             }
             windows.append(window)
         }
+
+        view.warmRemaining()
 
         NSApp.activate(ignoringOtherApps: true)
         NSAnimationContext.runAnimationGroup { context in
