@@ -32,13 +32,14 @@ existing `set-wallpaper` command.
 - Bash
 - A `set-wallpaper` command in `PATH` or at `~/.local/bin/set-wallpaper`
 
-The theme integration additionally expects:
+The optional theme integration is designed for my custom
+[`set-theme`](https://github.com/mayaanhafeez/set-theme) workflow and expects:
 
-- Active theme name at `~/set-theme/current_theme`
+- An active theme name written by `set-theme` to `~/set-theme/current_theme`
 - SketchyBar palettes under `~/.config/sketchybar/themes/`
 
-These theme files are optional when you pass a wallpaper directory explicitly;
-the overlay has built-in fallback colors.
+You do not need `set-theme` when passing a wallpaper directory explicitly. The
+overlay has built-in fallback colors.
 
 ## Install
 
@@ -53,7 +54,8 @@ first run.
 
 ## Usage
 
-Open the wallpaper directory for your active theme:
+With [`set-theme`](https://github.com/mayaanhafeez/set-theme) configured, open
+the wallpaper directory for your active theme:
 
 ```sh
 ./wallpaper-pick
