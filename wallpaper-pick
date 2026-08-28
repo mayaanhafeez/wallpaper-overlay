@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Wallpaper picker front end for the full-screen overlay.
+#
+# The overlay is a tiny compiled AppKit program, but sketchybar's palette lives
+# in Lua theme files. Scrape just the colour constants here so the picker feels
+# like part of the active bar while the Swift side stays a focused chooser.
+set -uo pipefail
+
+pkill -x wallpaper_overlay >/dev/null 2>&1
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OVERLAY="$SCRIPT_DIR/bin/wallpaper_overlay"
+
+if [ ! -x "$OVERLAY" ]; then
+  make -C "$SCRIPT_DIR" >/dev/null
+fi
+if [ ! -x "$OVERLAY" ]; then
+  printf 'wallpaper-pick: missing overlay binary: %s\n' "$OVERLAY" >&2
+  exit 1
+fi
+
+theme="$(tr -d '[:space:]' < "$HOME/set-theme/current_theme")"
+dir="$HOME/Pictures/wallpapers/$theme"
+
+has_images() {
+  local path=$1
+  [ -d "$path" ] || return 1
+  find "$path" -maxdepth 1 -type f \( \
+    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o \
+    -iname '*.heif' -o -iname '*.tiff' -o -iname '*.tif' -o -iname '*.gif' -o \
+    -iname '*.bmp' -o -iname '*.webp' \
+  \) ! -name '.*' -print -quit | grep -q .
+}
+
+if [ "${1-}" != "" ]; then
+  dir=$1
+elif ! has_images "$dir"; then
+  printf 'wallpaper-pick: no images in %s, falling back to ~/Pictures/wallpapers\n' "$dir" >&2
+  dir="$HOME/Pictures/wallpapers"
+fi
+
+theme_file="$HOME/.config/sketchybar/themes/${theme//-/_}.lua"
+palette_value() {
+  local key=$1
+  [ -f "$theme_file" ] || return 1
+  awk -v key="$key" '
+    $1 == key && $2 == "=" {
+      value = $3
+      sub(/,$/, "", value)
+      print value
+      exit
+    }
+  ' "$theme_file"
+}
+
+args=(--dir "$dir")
+if accent=$(palette_value iris) && [ -n "$accent" ]; then
+  args+=(--accent "$accent")
+fi
+if value=$(palette_value text) && [ -n "$value" ]; then
+  args+=(--value "$value")
+fi
+if muted=$(palette_value muted) && [ -n "$muted" ]; then
+  args+=(--muted "$muted")
+fi
+if title_color=$(palette_value subtle) && [ -n "$title_color" ]; then
+  args+=(--title-color "$title_color")
+fi
+if base=$(palette_value base) && [ -n "$base" ]; then
+  dim="0xd1${base:4:6}"
+  args+=(--dim "$dim")
+fi
+
+current=$(osascript -e 'tell application "System Events" to tell current desktop to get picture' 2>/dev/null || true)
+if [ -n "$current" ]; then
+  args+=(--select "$current")
+fi
+
+chosen=$("$OVERLAY" "${args[@]}")
+status=$?
+if [ "$status" -ne 0 ] || [ -z "$chosen" ]; then
+  exit 0
+fi
+
+if command -v set-wallpaper >/dev/null 2>&1; then
+  SET_WALLPAPER=$(command -v set-wallpaper)
+elif [ -x "$HOME/.local/bin/set-wallpaper" ]; then
+  SET_WALLPAPER="$HOME/.local/bin/set-wallpaper"
+else
+  printf 'wallpaper-pick: set-wallpaper not found\n' >&2
+  exit 1
+fi
+
+"$SET_WALLPAPER" "$chosen"
