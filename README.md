@@ -35,7 +35,7 @@ existing `set-wallpaper` command.
 The optional theme integration is designed for my custom
 [`set-theme`](https://github.com/mayaanhafeez/set-theme) workflow and expects:
 
-- An active theme name written by `set-theme` to `~/set-theme/current_theme`
+- An active theme name written by `set-theme` to `~/.config/theme`
 - SketchyBar palettes under `~/.config/sketchybar/themes/`
 
 You do not need `set-theme` when passing a wallpaper directory explicitly. The

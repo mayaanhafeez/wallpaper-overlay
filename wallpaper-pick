@@ -19,13 +19,13 @@ if [ ! -x "$OVERLAY" ]; then
   exit 1
 fi
 
-theme="$(tr -d '[:space:]' < "$HOME/set-theme/current_theme")"
+theme="$(tr -d '[:space:]' < "$HOME/.config/theme")"
 dir="$HOME/Pictures/wallpapers/$theme"
 
 has_images() {
   local path=$1
   [ -d "$path" ] || return 1
-  find "$path" -maxdepth 1 -type f \( \
+  find "$path/" -maxdepth 1 -type f \( \
     -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o \
     -iname '*.heif' -o -iname '*.tiff' -o -iname '*.tif' -o -iname '*.gif' -o \
     -iname '*.bmp' -o -iname '*.webp' \
