@@ -114,8 +114,11 @@ func absolutePath(_ path: String) -> String {
         .standardizedFileURL.path
 }
 
+/// Wallpaper folders are often symlinked into place, and FileManager will not list
+/// through a link to a directory, so resolve before reading it.
 func wallpapers(in dir: String) -> [Wallpaper] {
     let url = URL(fileURLWithPath: absolutePath(dir), isDirectory: true)
+        .resolvingSymlinksInPath()
     guard let contents = try? FileManager.default.contentsOfDirectory(
         at: url,
         includingPropertiesForKeys: [.isRegularFileKey],
@@ -125,7 +128,9 @@ func wallpapers(in dir: String) -> [Wallpaper] {
     return contents.compactMap { url in
         guard !url.lastPathComponent.hasPrefix(".") else { return nil }
         guard imageExtensions.contains(url.pathExtension.lowercased()) else { return nil }
-        let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+        // Resource values describe the link itself, so check what it points at; a
+        // dangling link resolves to nothing and drops out here.
+        let values = try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey])
         guard values?.isRegularFile == true else { return nil }
         return Wallpaper(url: url.standardizedFileURL)
     }.sorted {
@@ -262,10 +267,11 @@ final class ThumbnailStore {
 
     /// Keyed by the source's identity and the size we rendered it at, so a re-saved
     /// wallpaper or a display with a different backing scale misses cleanly rather than
-    /// serving something stale or the wrong size.
+    /// serving something stale or the wrong size. The identity is the link target's, so
+    /// repointing a symlinked wallpaper misses too.
     private func cacheURL(for path: String) -> URL? {
         guard let directory = cacheDirectory else { return nil }
-        let values = try? URL(fileURLWithPath: path)
+        let values = try? URL(fileURLWithPath: path).resolvingSymlinksInPath()
             .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
         let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
         let size = values?.fileSize ?? 0
@@ -820,8 +826,9 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private func initialSelection() -> Int {
         guard let select = options.select else { return 0 }
-        let path = absolutePath(select)
-        return wallpapers.firstIndex { $0.path == path } ?? 0
+        // macOS may report either a link or its target, so compare where both lead.
+        let target = URL(fileURLWithPath: absolutePath(select)).resolvingSymlinksInPath().path
+        return wallpapers.firstIndex { $0.url.resolvingSymlinksInPath().path == target } ?? 0
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {

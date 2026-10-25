@@ -25,7 +25,8 @@ dir="$HOME/Pictures/wallpapers/$theme"
 has_images() {
   local path=$1
   [ -d "$path" ] || return 1
-  find "$path/" -maxdepth 1 -type f \( \
+  # -L so symlinked wallpapers count, matching what the overlay will list.
+  find -L "$path/" -maxdepth 1 -type f \( \
     -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o \
     -iname '*.heif' -o -iname '*.tiff' -o -iname '*.tif' -o -iname '*.gif' -o \
     -iname '*.bmp' -o -iname '*.webp' \
